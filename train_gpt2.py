@@ -131,32 +131,93 @@ def rmsnorm(x0, eps=1e-6):
     x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
     return x.type_as(x0)
 
+def l2norm(t, dim = -1):
+    return F.normalize(t, dim = dim, p = 2)
+
+import math
+def lambda_init_fn(depth):
+    return 0.8 - 0.6 * math.exp(-0.3 * depth)
+
+# for use with parametrize
+
+class L2Norm(nn.Module):
+    def __init__(self, dim = -1):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, t):
+        return l2norm(t, dim = self.dim)
+
+class NormLinear(nn.Module):
+    def __init__(self, dim, dim_out, norm_dim_in = True):
+        super().__init__()
+        self.linear = nn.Linear(dim, dim_out, bias = False)
+        self.l2norm = L2Norm(dim = -1 if norm_dim_in else 0)
+        # self.norm_weights_()
+
+    # @torch.no_grad()
+    # def norm_weights_(self):
+    #     self.weight.copy_(self.l2norm(self.weight))
+
+    @property
+    def weight(self):
+        return self.linear.weight
+
+    def forward(self, x):
+        return self.linear(x)
+
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, depth):
         super().__init__()
         self.n_head = config.n_head
         self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
+        self.head_dim = self.n_embd // self.n_head // 2
         assert self.n_embd % self.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(self.n_embd, 3 * self.n_embd, bias=False)
+        # self.c_q = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        # self.c_k = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        # self.c_v = nn.Linear(self.n_embd, self.n_embd, bias=False)
+
+        self.c_q = NormLinear(self.n_embd, self.n_embd)
+        self.c_k = NormLinear(self.n_embd, self.n_embd)
+        self.c_v = NormLinear(self.n_embd, self.n_embd)
+
         # output projection
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        # self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_proj = NormLinear(self.n_embd, self.n_embd, norm_dim_in = False)
         self.rotary = Rotary(self.head_dim)
 
-    def forward(self, x):
+        self.lambda_init = lambda_init_fn(depth)
+    def forward(self, x, lambdas):
+        lambda_q1, lambda_k1, lambda_q2, lambda_k2 = lambdas
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, self.head_dim)
-        q = q.view(B, T, self.n_head, self.head_dim)
-        v = v.view(B, T, self.n_head, self.head_dim)
+        q, k, v = self.c_q(x), self.c_k(x), self.c_v(x)
+        # k = l2norm(k.view(B, T, self.n_head, self.head_dim)) * self.head_dim**0.25
+        # q = l2norm(q.view(B, T, self.n_head, self.head_dim)) * self.head_dim**0.25
+        k = k.view(B, T, 2 * self.n_head, self.head_dim)
+        q = q.view(B, T, 2 * self.n_head, self.head_dim)
+        v = v.view(B, T, self.n_head, 2 * self.head_dim).transpose(1, 2)
         cos, sin = self.rotary(q)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+        q = q.view(B, T, self.n_head, 2, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_head, 2, self.head_dim).transpose(1, 2)
+        q1, q2 = q[:, :, :, 0], q[:, :, :, 1]
+        k1, k2 = k[:, :, :, 0], k[:, :, :, 1]
+        # y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True, scale=1.)
+
+        # y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+        y1 = F.scaled_dot_product_attention(q1, k1, v, is_causal=True)
+        y2 = F.scaled_dot_product_attention(q2, k2, v, is_causal=True)
+
+        lambda_1 = torch.exp(torch.sum(lambda_q1 * lambda_k1, dim=-1).float()).type_as(x)
+        lambda_2 = torch.exp(torch.sum(lambda_q2 * lambda_k2, dim=-1).float()).type_as(x)
+        lambda_full = lambda_1 - lambda_2 + self.lambda_init
+        y = y1 - lambda_full * y2
+        y = rmsnorm(y)
+        y = y * (1 - self.lambda_init)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
@@ -166,8 +227,10 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        # self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        # self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.c_fc    = NormLinear(config.n_embd, 4 * config.n_embd)
+        self.c_proj  = NormLinear(4 * config.n_embd, config.n_embd, norm_dim_in = False)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -177,14 +240,22 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, depth):
         super().__init__()
-        self.attn = CausalSelfAttention(config)
+        self.attn = CausalSelfAttention(config, depth)
         self.mlp = MLP(config)
         self.attn_scale = (1 / (2 * config.n_layer)**0.5)
 
-    def forward(self, x):
-        x = x + self.attn_scale * self.attn(rmsnorm(x))
+    # def forward(self, x, scales):
+    def forward(self, x, lambdas):
+        scale_a = 0.3
+        scale_m = 0.36
+        # scale_a, scale_m = scales
+        # scale_a = scale_a * 0.05 * x.shape[-1] ** -0.5
+        # scale_m = scale_m * 0.05 * x.shape[-1] ** -0.5
+        # x = l2norm(x + scale_a * (l2norm(self.attn(x)) - x))
+        # x = l2norm(x + scale_m * (l2norm(self.mlp(x)) - x))
+        x = x + self.attn_scale * self.attn(rmsnorm(x), lambdas)
         x = x + self.mlp(rmsnorm(x))
         return x
 
@@ -205,25 +276,46 @@ class GPT(nn.Module):
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            # wte = nn.Embedding(config.vocab_size, config.n_embd),
+            h = nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        # self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = NormLinear(config.n_embd, config.vocab_size)
+        # self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        self.lambdas = nn.ParameterList([])
+        self.head_dim = config.n_embd // config.n_head // 2
+        for _ in range(config.n_layer):
+            self.lambdas.append(nn.ParameterList([
+                    nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1)),
+                    nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1)),
+                    nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1)),
+                    nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1)),
+                ]))
+        # self.residual_lerp_scales = nn.ParameterList([])
+        # residual_lerp_scale_init = config.n_embd ** -0.5
+        # for _ in range(config.n_layer):
+        #     self.residual_lerp_scales.append(nn.ParameterList([
+         #            nn.Parameter(torch.ones(config.n_embd) * residual_lerp_scale_init),
+         #            nn.Parameter(torch.ones(config.n_embd) * residual_lerp_scale_init),
+         #        ]))
 
     def forward(self, idx, targets=None, return_logits=True):
         b, t = idx.size()
         pos = torch.arange(0, t, dtype=torch.long, device=idx.device) # shape (t)
 
         # forward the GPT model itself
-        x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        # x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        x = self.lm_head.weight[idx] # token embeddings of shape (b, t, n_embd)
 
-        for block in self.transformer.h:
-            x = block(x)
+        # for (block, scales) in zip(self.transformer.h, self.residual_lerp_scales):
+        for (block, lambdas) in zip(self.transformer.h, self.lambdas):
+            # x = block(x, scales)
+            x = block(x, lambdas)
         x = rmsnorm(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
+            # logits = self.lm_head(x * 96)
             logits = self.lm_head(x)
             logits = logits.float() # use tf32/fp32 for logits
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
@@ -238,9 +330,18 @@ class GPT(nn.Module):
             logits = None
 
         return logits, loss
+    
+    @torch.no_grad()
+    def norm_weights_(self):
+        for module in self.modules():
+            if not isinstance(module, NormLinear):
+                continue
+
+            module.norm_weights_()
 
     def configure_optimizers(self, weight_decay, learning_rate, betas):
         optimizer = CombinedOptimizer([
+            # torch.optim.AdamW([*self.lm_head.parameters(), *self.residual_lerp_scales.parameters()], lr=learning_rate, betas=betas, weight_decay=0, fused=True),
             torch.optim.AdamW(self.lm_head.parameters(), lr=learning_rate, betas=betas, weight_decay=0, fused=True),
             OrthogonalNesterov(self.transformer.h.parameters(), lr=0.1*learning_rate, momentum=0.95)
         ])
@@ -485,6 +586,7 @@ if __name__ == "__main__":
         # step the optimizer
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+        # model.module.norm_weights_()
         # --------------- TRAINING SECTION END -------------------
         # everything that follows now is just diagnostics, prints, logging, etc.
         torch.cuda.synchronize()
