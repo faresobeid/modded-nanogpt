@@ -171,7 +171,8 @@ class CausalSelfAttention(nn.Module):
         self.c_k = CastedLinear(dim, dim)
         self.c_v = CastedLinear(dim, dim)
         # value residual lambda
-        self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
+        # self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
+        self.lamb = CastedLinear(dim, 1) # @Grad62304977
         # rotary embeddings
         self.rotary = Rotary(dim // n_head) # dim // n_head = head_dim
         # output projection
@@ -185,14 +186,13 @@ class CausalSelfAttention(nn.Module):
         v = self.c_v(x).view(B, T, self.n_head, -1)
         if v1 is None:
             v1 = v # This happens if we are in the first block. v needs to be accessed by subsequent blocks
-        v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
+        lamb = torch.sigmoid(self.lamb(x))
+        v = (1 - lamb) * v + lamb * v1.view_as(v) # @Grad62304977
         q, k = norm(q), norm(k) # QK norm suggested by @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
-        print(q.shape)
         y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
-        print(y.shape)
         return y, v1
 
 class MLP(nn.Module):
@@ -414,11 +414,17 @@ enable_math_sdp(False)
 # init the optimizer(s)
 optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.3,   betas=(0.9, 0.95), fused=True)
 optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.002, betas=(0.9, 0.95), fused=True)
-params = list(raw_model.transformer.h.parameters())
-matrix_params = [p for p in params if p.ndim == 2]
-scalar_params = [p for p in params if p.ndim < 2]
+params = list(raw_model.transformer.h.named_parameters())
+matrix_params = []
+scalar_params = []
+for n,p in params:
+    if "lamb" in n:
+        scalar_params.append(p)
+    else:
+        matrix_params.append(p)
+
 optimizer3 = Muon(matrix_params,           lr=0.02,  momentum=0.95)
-optimizer4 = torch.optim.Adam(scalar_params, lr=0.02, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
+optimizer4 = torch.optim.Adam(scalar_params, lr=0.002, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
