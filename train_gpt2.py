@@ -14,7 +14,9 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
-
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+flex_attention = torch.compile(flex_attention, dynamic=False)
+create_block_mask = torch.compile(create_block_mask, dynamic=False)
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
@@ -167,30 +169,31 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert dim % n_head == 0
         self.n_head = n_head
+        self.n_kv_head = n_head // 2
         self.c_q = CastedLinear(dim, dim)
-        self.c_k = CastedLinear(dim, dim)
-        self.c_v = CastedLinear(dim, dim)
+        self.c_k = CastedLinear(dim, dim//2)
+        self.c_v = CastedLinear(dim, dim//2)
+        # self.shift_wk = CastedLinear(dim, 1)
+        # self.shift_wv = CastedLinear(dim, 1)
         # value residual lambda
-        # self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
-        self.lamb = CastedLinear(dim, 1) # @Grad62304977
+        self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
         # rotary embeddings
         self.rotary = Rotary(dim // n_head) # dim // n_head = head_dim
         # output projection
         self.c_proj = CastedLinear(dim, dim)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
-
-    def forward(self, x, v1):
+    def forward(self, x, v1, block_mask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         q = self.c_q(x).view(B, T, self.n_head, -1)
-        k = self.c_k(x).view(B, T, self.n_head, -1)
-        v = self.c_v(x).view(B, T, self.n_head, -1)
+        k = self.c_k(x).view(B, T, self.n_kv_head, -1)
+        v = self.c_v(x).view(B, T, self.n_kv_head, -1)
         if v1 is None:
             v1 = v # This happens if we are in the first block. v needs to be accessed by subsequent blocks
-        lamb = torch.sigmoid(self.lamb(x))
-        v = (1 - lamb) * v + lamb * v1.view_as(v) # @Grad62304977
+        v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
         q, k = norm(q), norm(k) # QK norm suggested by @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
-        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, enable_gqa=True)
+        # y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y, v1
@@ -199,8 +202,8 @@ class MLP(nn.Module):
 
     def __init__(self, dim):
         super().__init__()
-        self.c_fc   = CastedLinear(dim, 4 * dim)
-        self.c_proj = CastedLinear(4 * dim, dim)
+        self.c_fc   = CastedLinear(dim, int(4.5 * dim))
+        self.c_proj = CastedLinear(int(4.5 * dim), dim)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x):
@@ -217,11 +220,11 @@ class Block(nn.Module):
         self.mlp = MLP(config.n_embd)
         # self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
-    def forward(self, x, v1, x0):
+    def forward(self, x, v1, x0, block_mask):
         # x = self.lambdas[0] * x + self.lambdas[1] * x0
-        x1, v1 = self.attn(norm(x), v1)
-        x = x + x1
-        x = x + self.mlp(norm(x))
+        x1, v1 = self.attn(norm(x), v1, block_mask)
+        x = x + norm(x1)
+        x = x + norm(self.mlp(norm(x)))
         return x, v1
 
 # -----------------------------------------------------------------------------
@@ -248,14 +251,25 @@ class GPT(nn.Module):
         self.lm_head.weight.data.zero_() # @Grad62304977
 
     def forward(self, idx, target):
-
+        # docs = (idx == 50256).cumsum(1)
+        def mask_fn(window_size):
+            def get_mask(b, h, q_idx, kv_idx):
+                # document_mask = docs[b,q_idx] == docs[b,kv_idx]
+                window_mask = q_idx - kv_idx < window_size
+                causal_mask = q_idx >= kv_idx
+                return causal_mask & window_mask 
+            return get_mask
         # forward the GPT model itself
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         x = F.rms_norm(x, (x.size(-1),)) # @Grad62304977
         x0 = x
         v1 = None
-        for block in self.transformer.h:
-            x, v1 = block(x, v1, x0)
+        S = x.shape[1]
+        global_block_mask = create_block_mask(mask_fn(S), None, None, S, S, device="cuda", _compile=True)
+        local_block_mask = create_block_mask(mask_fn(512), None, None, S, S, device="cuda", _compile=True)
+        for i,block in enumerate(self.transformer.h):
+            block_mask = local_block_mask if i % 2 == 0 else global_block_mask
+            x, v1 = block(x, v1, x0, block_mask)
         x = F.rms_norm(x, (x.size(-1),))
 
         logits = self.lm_head(x)
@@ -417,15 +431,19 @@ optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.002, beta
 params = list(raw_model.transformer.h.named_parameters())
 matrix_params = []
 scalar_params = []
+vector_params = []
 for n,p in params:
     if "lamb" in n:
         scalar_params.append(p)
+    elif "shift" in n:
+        vector_params.append(p)
     else:
         matrix_params.append(p)
 
 optimizer3 = Muon(matrix_params,           lr=0.02,  momentum=0.95)
-optimizer4 = torch.optim.Adam(scalar_params, lr=0.002, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
-optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
+optimizer4 = torch.optim.Adam(scalar_params, lr=0.02, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
+optimizer5 = torch.optim.Adam(vector_params, lr=0.002, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
+optimizers = [optimizer1, optimizer2, optimizer3, optimizer4, optimizer5]
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
     assert it <= args.num_iterations
