@@ -127,8 +127,19 @@ def norm(x):
 
 class CastedLinear(nn.Linear):
 
-    def __init__(self, in_features, out_features):
+    def __init__(self, in_features, out_features, init_std=None):
         super().__init__(in_features, out_features, bias=False)
+        # init_std = in_features ** -0.5 if init_std is None else init_std
+        # self.reset_parameters(init_std)
+
+    # def reset_parameters(self):
+    #     nn.init.trunc_normal_(
+    #         self.weight,
+    #         mean=0.0,
+    #         std=init_std,
+    #         a=-3 * init_std,
+    #         b=3 * init_std,
+    #     )
 
     def forward(self, x):
         return F.linear(x, self.weight.to(x.dtype))
@@ -173,28 +184,42 @@ class CausalSelfAttention(nn.Module):
         self.c_q = CastedLinear(dim, dim)
         self.c_k = CastedLinear(dim, dim//2)
         self.c_v = CastedLinear(dim, dim//2)
-        # self.shift_wk = CastedLinear(dim, 1)
-        # self.shift_wv = CastedLinear(dim, 1)
+        self.shift_k = CastedLinear(dim, 1)
+        self.shift_v = CastedLinear(dim, 1)
+        self.shift_k.weight.data.zero_()
+        self.shift_v.weight.data.zero_()
         # value residual lambda
         self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
+        # self.shift_k = nn.Parameter(torch.tensor(0.0)) # @Grad62304977
+        # self.shift_v = nn.Parameter(torch.tensor(0.0)) # @Grad62304977
         # rotary embeddings
         self.rotary = Rotary(dim // n_head) # dim // n_head = head_dim
         # output projection
         self.c_proj = CastedLinear(dim, dim)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+        self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
     def forward(self, x, v1, block_mask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
+        shift_k = self.shift_k(x)
+        shift_v = self.shift_v(x)
+        xx = self.time_shift(x) - x
+        xk = x + shift_k * xx
+        xv = x + shift_v * xx
         q = self.c_q(x).view(B, T, self.n_head, -1)
-        k = self.c_k(x).view(B, T, self.n_kv_head, -1)
-        v = self.c_v(x).view(B, T, self.n_kv_head, -1)
+        k = self.c_k(xk).view(B, T, self.n_kv_head, -1)
+        v = self.c_v(xv).view(B, T, self.n_kv_head, -1)
         if v1 is None:
             v1 = v # This happens if we are in the first block. v needs to be accessed by subsequent blocks
         v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
+        # values_max = v.amax(dim=1, keepdim=True).detach() # numerical stability
+        # v = (v - values_max).exp()
         q, k = norm(q), norm(k) # QK norm suggested by @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, enable_gqa=True)
         # y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
+        # y = y.transpose(1, 2).contiguous()
+        # y = (y.log() + values_max.repeat_interleave(self.n_head//self.n_kv_head, -2)).view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y, v1
 
@@ -444,6 +469,7 @@ optimizer3 = Muon(matrix_params,           lr=0.02,  momentum=0.95)
 optimizer4 = torch.optim.Adam(scalar_params, lr=0.02, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
 optimizer5 = torch.optim.Adam(vector_params, lr=0.002, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4, optimizer5]
+# optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
     assert it <= args.num_iterations
