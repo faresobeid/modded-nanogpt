@@ -1,3 +1,4 @@
+
 import os
 import sys
 with open(sys.argv[0]) as f:
@@ -14,6 +15,9 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+# Weights & Biases
+import wandb
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -379,6 +383,17 @@ if master_process:
         f.write('='*100 + '\n')
         f.write(code)
         f.write('='*100 + '\n')
+    
+    # init wandb
+    wandb.init(
+        project="my-gpt-training",
+        name=run_id,
+        config={
+            "model_config": GPTConfig().__dict__,
+            "hyperparameters": args.__dict__,
+        }
+    )
+    
 def print0(s, logonly=False):
     if master_process:
         with open(logfile, "a") as f:
@@ -490,6 +505,8 @@ for step in range(args.num_iterations + 1):
         val_loss /= val_steps
         # log val loss to console and to logfile
         print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+        if master_process:
+            wandb.log({"val/loss": val_loss.item()}, step=step)
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -531,6 +548,14 @@ for step in range(args.num_iterations + 1):
     # momentum warmup for Muon
     frac = min(step/500, 1)
     optimizer3.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+    
+    # Log grad norms
+    if master_process:
+      grad_norm_dict = {}
+    for name, p in raw_model.named_parameters():
+        if p.ndim == 2:
+            grad_norm_dict[f"grad_norm/{name}"] = p.grad.norm().item()
+
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
@@ -544,9 +569,24 @@ for step in range(args.num_iterations + 1):
     approx_time = training_time_ms + 1000 * (time.time() - t0)
     print0(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
 
+    if master_process:
+        lrs = [opt.param_groups[0]['lr'] for opt in optimizers]
+        log_dict = {
+            "train/loss": train_loss.item(),
+            "lr/wte": lrs[0],
+            "lr/lm_head": lrs[1],
+            "lr/muon": lrs[2],
+            "lr/adam": lrs[3],
+            "muon_momentum": optimizer3.param_groups[0]['momentum'],
+        }
+        for param_name, layer_norms in grad_norm_dict.items():
+          for layer_idx, norm in layer_norms:
+              log_dict[param_name] = log_dict.get(param_name, {})
+              log_dict[param_name][f"layer_{layer_idx}"] = norm
+        wandb.log(log_dict, step=step)
+
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+    wandb.finish()
 
 # -------------------------------------------------------------------------
-# clean up nice
-dist.destroy_process_group()
