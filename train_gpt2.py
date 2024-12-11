@@ -551,10 +551,10 @@ for step in range(args.num_iterations + 1):
     
     # Log grad norms
     if master_process:
-      grad_norm_dict = {}
-    for name, p in raw_model.named_parameters():
-        if p.ndim == 2:
-            grad_norm_dict[f"grad_norm/{name}"] = p.grad.norm().item()
+        grad_norm_dict = {}
+        for name, p in raw_model.named_parameters():
+            if p.ndim == 2:
+                grad_norm_dict[f"grad_norm/{name}"] = p.grad.norm().item()
 
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
