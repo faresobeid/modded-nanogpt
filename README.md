@@ -1,94 +1,58 @@
 # Modded-NanoGPT
 
 This is a modified variant of the [PyTorch GPT-2 trainer](https://github.com/karpathy/llm.c/blob/7b929300217ff1a974b63791a228928b39b26409/train_gpt2.py) from
-Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo, which attains the same final validation loss in only:
-* 0.75B tokens instead of 10B
-* 4.4 minutes on 8xH100 instead of 45
+Andrej Karpathy's [llm.c](https://github.com/karpathy/llm.c) repo, which attains the same final validation loss in:
+* 1.7B tokens instead of 10B
+* 7.8 minutes on 8xH100 instead of 45
 
 It uses the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU^2.
-* New optimizer: [Muon - Momentum Orthogonalized by Newton-schulz](https://github.com/KellerJordan/Muon).
+* New optimizer: Muon - Momentum Orthogonalized by Newton-schulz.
 * Untied head from embedding.
 * Projection and classification layers initialized to zero (muP-like).
 * Architectural shortcuts: value residual and embedding shortcut (partially following https://arxiv.org/abs/2410.17897).
 * Momentum warmup.
 * Tanh soft logit capping (following Gemma 2).
-* FlexAttention with window size warmup.
-* Extra embeddings which are fed into intermediate attention layers.
-
-The training has attained this speed due to the contributions of meself, [@Grad62304977](https://x.com/Grad62304977),
-[@jxbz](https://x.com/jxbz), [@bozavlado](https://x.com/bozavlado), [@brendanh0gan](https://x.com/brendanh0gan),
-[@KoszarskyB](https://x.com/KoszarskyB), & [@fernbear.bsky.social](https://bsky.app/profile/fernbear.bsky.social).
 
 ---
 
-## Running the current record
+## Running the training
 
-To install and execute the training, run the following four commands.
+To execute the training, run the following three commands.
 They should all complete within <20min on an 8xH100 with decent internet connection.
-If the torch install command updates your cuda installation, you many need to reboot.
 ```bash
-git clone https://github.com/KellerJordan/modded-nanogpt.git & cd modded-nanogpt
 pip install -r requirements.txt
-pip install --pre torch==2.6.0.dev20241203+cu124 --index-url https://download.pytorch.org/whl/nightly/cu124 --upgrade # install torch 2.6.0
-python data/cached_fineweb10B.py 10 # downloads only the first 1.0B training tokens to save time
+python data/cached_fineweb10B.py 18 # downloads only the first 1.8B training tokens to save time
 ./run.sh
 ```
 
-The result will be a transformer with 124M active parameters trained for 1430 steps on 0.75B tokens of Fineweb [1], achieving ~3.278 mean validation loss (w/ up to 0.005 inter-run stddev).
+The result will be a transformer with 124M active parameters trained for 3242 steps on 1.7B tokens of Fineweb [1], achieving ~3.278 validation loss.
 For comparison, the default llm.c PyTorch trainer yields [>3.28 validation loss after training for 19560 steps on 10B tokens](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
-
-**Note: torch.compile will take a long time on the first run.**
 
 ## Running it on fewer GPUs or with less memory
 
-* To run on fewer GPUs, just modify `run.sh` to have a different `--nproc_per_node`. (this does not change the expected behavior of the training)
-* If you're running out of memory, you may need to reduce the sequence length for FlexAttention (which does change the training. see [here](https://github.com/KellerJordan/modded-nanogpt/pull/38) for a guide)
+* To run on fewer GPUs, just modify `run.sh` to have a different `--nproc_per_node`.
+* If you're running out of memory, then go into `train_gpt2.py` and scale down the `device_batch_size` to either 16 or 32.
 
-## Running with Docker
+Both of these changes will have no effect on the training - you should get the exact same loss curve as the most recent record, because the training code
+will automatically adjust the gradient accumulation in order to have the same total batch size.
 
-For cases where CUDA or NCCL versions aren't compatible with your current system setup, Docker can be a helpful alternative.
-This approach standardizes versions for CUDA, NCCL, CUDNN, and Python, reducing dependency issues and simplifying setup. 
-Note: an NVIDIA driver must already be installed on the system (useful if only the NVIDIA driver and Docker are available).
-
-```bash
-sudo docker build -t modded-nanogpt .
-sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt python data/cached_fineweb10B.py 18
-sudo docker run -it --rm --gpus all -v $(pwd):/modded-nanogpt modded-nanogpt sh run.sh
-```
 ---
 
 ## World record history
 
 The following is the progression of world records for the task of *training a model with 124M active parameters to 3.28 validation loss on FineWeb in the minimal amount of time on an 8xH100 machine.*
 
-| # | Record time | Description | Date | Log | Contributors |
-| - | - | - | - | - | - |
-1 | 45 minutes | [llm.c baseline](https://github.com/karpathy/llm.c/discussions/481) | 05/28/24 | [log](./records/101324_llmc/main.log) | @karpathy, llm.c contributors
-2 | 31.4 minutes | [Architectural modernizations & tuned learning rate](https://x.com/kellerjordan0/status/1798863559243513937) | 06/06/24 | [log](./records/060624_AdamW/f66d43d7-e449-4029-8adf-e8537bab49ea.log) | @kellerjordan0
-3 | 24.9 minutes | [Introduced the Muon optimizer](https://x.com/kellerjordan0/status/1842300916864844014) | 10/04/24 | none | @kellerjordan0, @jxbz
-4 | 22.3 minutes | [Muon improvements](https://x.com/kellerjordan0/status/1844820919061287009) | 10/11/24 | [log](./records/101024_Muon/eb5659d0-fb6a-49e5-a311-f1f89412f726.txt) | @kellerjordan0, @bozavlado
-5 | 15.2 minutes | [Pad embeddings & architectural improvements](https://x.com/kellerjordan0/status/1845865698532450646) | 10/14/24 | [log](./records/101424_ModernArch/dabaaddd-237c-4ec9-939d-6608a9ed5e27.txt) | @Grad62304977, @kellerjordan0
-6 | 13.1 minutes | [Distributed the overhead of Muon](https://x.com/kellerjordan0/status/1847291684016783746) | 10/18/24 | [log](./records/101724_DistributedMuon/22d24867-eb5a-4fcc-ae2c-263d0277dfd1.txt) | @kellerjordan0
-7 | 12.0 minutes | [Upgraded PyTorch from 2.4.1 to 2.5.0](https://x.com/kellerjordan0/status/1847358578686152764) | 10/18/24 | [log](./records/101824_PyTorch25/d4bfb25f-688d-4da5-8743-33926fad4842.txt) | @kellerjordan0
-8 | 10.8 minutes | [Untied embed and lm_head](https://x.com/kellerjordan0/status/1853188916704387239) | 11/03/24 | [log](./records/110324_UntieEmbed/d6b50d71-f419-4d26-bb39-a60d55ae7a04.txt) | @Grad62304977, @kellerjordan0
-9 | 8.2 minutes | [Shortcuts & tweaks](https://x.com/kellerjordan0/status/1854296101303800108) | 11/06/24 | [log](./records/110624_ShortcutsTweaks/dd7304a6-cc43-4d5e-adb8-c070111464a1.txt) | @Grad62304977, @kellerjordan0
-10 | 7.8 minutes | [Bfloat16 activations](https://x.com/kellerjordan0/status/1855267054774865980) | 11/08/24 | [log](./records/110824_CastBf16/a833bed8-2fa8-4cfe-af05-58c1cc48bc30.txt) | @kellerjordan0
-11 | 7.2 minutes | [U-net & 2x lr](https://x.com/kellerjordan0/status/1856053121103093922) | 11/10/24 | [log](./records/111024_UNetDoubleLr/c87bb826-797b-4f37-98c7-d3a5dad2de74.txt) | @brendanh0gan
-12 | 5.03 minutes | [FlexAttention](https://x.com/kellerjordan0/status/1859331370268623321) | 11/19/24 | [log](./records/111924_FlexAttention/8384493d-dba9-4991-b16b-8696953f5e6d.txt) | @KoszarskyB
-13 | 4.66 minutes | [Attention window warmup](https://x.com/hi_tysam/status/1860851011797053450) | 11/24/24 | [log](./records/112424_WindowWarmup/cf9e4571-c5fc-4323-abf3-a98d862ec6c8.txt) | @fernbear.bsky.social
-14 | 4.41 minutes | [Value Embeddings](https://x.com/KoszarskyB/status/1864746625572257852) | 12/04/24 | [log](./records/120424_ValueEmbed) | @KoszarskyB
-15 | 3.95 minutes | [U-net pattern for value embeds, assorted code improvements](https://x.com/YouJiacheng/status/1865761473886347747) | 12/08/24 | [log](records/120824_UNetValueEmbedsTweaks) | @leloykun, @YouJiacheng
-
-### Speedrun rules
-
-All new record attempts:
-
-1. Must not modify the train or validation data pipelines. (Except to change batch size, seqlen, attention structure etc. I.e., just don't change the underlying tokens.)
-2. Must use ≤ 124M active parameters per token. (So MoE is fine; and extra embedding layers can be added since they only contribute hidden_dim active params.)
-3. Must attain ≤ 3.28 val loss. Unfortunately, due to high inter-run variance, new record attempts must provide enough run logs to attain a statistical significance level of p<0.01 that their average val loss is lower than 3.28. You see see how to conduct a t-test [here](./records/120424_ValueEmbed).
-
-Other than that, go crazy! Anything is fair game
+1. [45 minutes: llm.c baseline](https://github.com/karpathy/llm.c/discussions/481) (05/28/24) [[training log](./records/101324_llmc/main.log)] (note: the 90 minute time is on 8xA100; it's 45 minutes on 8xH100. This run is essentially a hardware-optimized GPT-2 (small) replication using better training data.)
+2. [31.4 minutes: Architectural modernizations and learning rate tuning](https://x.com/kellerjordan0/status/1798863559243513937) (06/06/24) [[training log](./records/060624_AdamW/f66d43d7-e449-4029-8adf-e8537bab49ea.log)] (note: this uses half the tokens as the baseline but isn't yet twice as fast since it's slower PyTorch code rather than raw CUDA. also note: most of the improvement here came from simply tripling the learning rate.)
+3. [24.9 minutes: Introduced the Muon optimizer](https://x.com/kellerjordan0/status/1842300916864844014) (10/04/24)
+4. [22.3 minutes: Muon improvements](https://x.com/kellerjordan0/status/1844820919061287009) (10/11/24) [[reproducible log](./records/101024_Muon/eb5659d0-fb6a-49e5-a311-f1f89412f726.txt)]
+5. [15.2 minutes: Pad embeddings & architectural modernizations](https://x.com/kellerjordan0/status/1845865698532450646) (10/14/24) [[reproducible log](./records/101424_ModernArch/dabaaddd-237c-4ec9-939d-6608a9ed5e27.txt)]
+6. [13.1 minutes: Distributed the overhead of Muon](https://x.com/kellerjordan0/status/1847291684016783746) (10/18/24) [[reproducible log](./records/101724_DistributedMuon/22d24867-eb5a-4fcc-ae2c-263d0277dfd1.txt)]
+7. [12.0 minutes: Upgraded PyTorch from 2.4.1 to 2.5.0](https://x.com/kellerjordan0/status/1847358578686152764) (10/18/24) [[reproducible log](./records/101824_PyTorch25/d4bfb25f-688d-4da5-8743-33926fad4842.txt)] (note: this now runs at the same speed per step as the CUDA llm.c trainer!)
+8. [10.8 minutes: Untied embed and lm_head](https://x.com/kellerjordan0/status/1853188916704387239) (11/03/24) [[reproducible log](./records/110324_UntieEmbed/d6b50d71-f419-4d26-bb39-a60d55ae7a04.txt)]
+9. [8.2 minutes: Shortcuts & tweaks](https://x.com/kellerjordan0/status/1854296101303800108) (11/06/24) [[reproducible log](./records/110624_ShortcutsTweaks/dd7304a6-cc43-4d5e-adb8-c070111464a1.txt)]
+11. [7.8 minutes: Bfloat16 activations](https://x.com/kellerjordan0/status/1855267054774865980) (11/08/24) [[reproducible log](./records/110824_CastBf16/a833bed8-2fa8-4cfe-af05-58c1cc48bc30.txt)]
 
 <!--Note: The original llm.c baseline is intended to be closer to a replication of GPT-2 than to an optimized LLM training.
 So it's no surprise that there is room to improve; as @karpathy has said, 'llm.c still has a lot of pending optimizations.'
@@ -105,16 +69,17 @@ The only possible 'benefit' I can think of for any empirical field to abandon be
 Hilarious to think about how, in the often-commented-upon and ongoing collapse of the peer review system, people blame the *reviewers* --
 yeah, those guys doing free labor who everyone constantly musters all of their intelligence to lie to, it's *their* fault! My bad, you caught me monologuing.-->
 
-### Notes
-* For the llm.c baseline: The 90 minute time is on 8xA100; it's 45 minutes on 8xH100. This baseline is essentially a hardware-optimized GPT-2-small replication using better training data.
-* All runs before 11/19/24 can be run with PyTorch 2.5.1 or below. Runs including and after 11/19/24 require PyTorch 2.6.0 (nightly) to use FlexAttention.
+### Notable attempts
 
----
+1. [An 11/07/24 attempt, which I attempted to cerify on 11/09/24](./records/110924_Replicateleloykun)
 
-### Notable forks
+### Speedrun rules
 
-* [https://github.com/BlinkDL/modded-nanogpt-rwkv](https://github.com/BlinkDL/modded-nanogpt-rwkv)
-* [https://github.com/nikhilvyas/modded-nanogpt-SOAP](https://github.com/nikhilvyas/modded-nanogpt-SOAP)
+1. Must not modify the train or validation data pipelines (except to change batch size if you want).
+2. Must use ≤ 124M active parameters per token.
+3. Must attain ≤ 3.28 val loss. A tasteful number would be 3.278 so that [this doesn't happen](./records/110924_Replicateleloykun/1621af10-aa0c-42af-bf54-8a773c63a2af.txt#L3780).
+
+Other than that, go crazy! Anything is fair game
 
 ---
 
@@ -167,9 +132,9 @@ def zeroth_power_via_newtonschulz5(G, steps=5, eps=1e-7):
     if G.size(0) > G.size(1):
         X = X.T 
     for _ in range(steps):
-        A = X @ X.T
-        B = b * A + c * A @ A
-        X = a * X + B @ X
+        A = X @ X.T 
+        B = A @ X 
+        X = a * X + b * B + c * A @ B 
     if G.size(0) > G.size(1):
         X = X.T 
     return X.to(G.dtype)
@@ -231,19 +196,6 @@ python data/cached_fineweb10B.py 18
 6. [Anil, Rohan, et al. "Scalable second order optimization for deep learning." arXiv preprint arXiv:2002.09018 (2020).](https://arxiv.org/abs/2002.09018)
 7. [Hägele, Alexander, et al. "Scaling Laws and Compute-Optimal Training Beyond Fixed Training Durations." arXiv preprint arXiv:2405.18392 (2024).](https://arxiv.org/abs/2405.18392)
 
-## Citation
-
-```
-@misc{modded_nanogpt_2024,
-  author       = {Keller Jordan and Jeremy Bernstein and Brendan Rappazzo and
-                  @fernbear.bsky.social and Boza Vlado and You Jiacheng and
-                  Franz Cesista and Braden Koszarsky and @Grad62304977},
-  title        = {modded-nanogpt: Speedrunning the NanoGPT baseline},
-  year         = {2024},
-  url          = {https://github.com/KellerJordan/modded-nanogpt},
-  note         = {Accessed: 2024-12-09}
-}
-```
+<iframe width="560" height="315" src="https://www.youtube.com/embed/dv13gl0a-FA" frameborder="0" allowfullscreen></iframe>
 
 <img src="img/dofa.jpg" alt="itsover_wereback" style="width:100%;">
-
