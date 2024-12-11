@@ -252,15 +252,17 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),)) # @Grad62304977
         x0 = x
         v1 = None
+        layer_outputs = []
         for block in self.transformer.h:
             x, v1 = block(x, v1, x0)
+            layer_outputs.append(x)
         x = F.rms_norm(x, (x.size(-1),))
 
         logits = self.lm_head(x)
         logits = 30 * torch.tanh(logits / 30) # @Grad62304977
         logits = logits.float()
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
-        return loss.float()
+        return loss.float(), layer_outputs, logits.mean()
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -500,7 +502,7 @@ for step in range(args.num_iterations + 1):
         for _ in range(val_steps):
             with torch.no_grad():
                 x_val, y_val = val_loader.next_batch()
-                val_loss += model(x_val, y_val)
+                val_loss += model(x_val, y_val)[0]
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         # log val loss to console and to logfile
@@ -531,9 +533,10 @@ for step in range(args.num_iterations + 1):
 
     # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
+    layer_outputs = None
     for i in range(1, train_accumulation_steps+1):
         # forward pass
-        loss = model(x, y)
+        loss, layer_outputs, logits_mean = model(x, y)
         train_loss = loss.detach()
         # advance the dataset for the next batch
         x, y = train_loader.next_batch()
@@ -555,6 +558,15 @@ for step in range(args.num_iterations + 1):
         for name, p in raw_model.named_parameters():
             if p.ndim == 2:
                 grad_norm_dict[f"grad_norm/{name}"] = p.grad.norm().item()
+
+    # Log hidden state norms
+    if master_process and layer_outputs is not None:
+        state_norm_dict = {}
+        for i, layer_output in enumerate(layer_outputs):
+            state_norm_dict[f"state_norm/layer_{i}"] = layer_output.norm().item()
+
+    if master_process and logits is not None:
+        logit_mean = logits_mean.item()
 
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
@@ -578,11 +590,13 @@ for step in range(args.num_iterations + 1):
             "lr/muon": lrs[2],
             "lr/adam": lrs[3],
             "muon_momentum": optimizer3.param_groups[0]['momentum'],
+            "logit_mean": logit_mean,
         }
-        for param_name, layer_norms in grad_norm_dict.items():
-          for layer_idx, norm in layer_norms:
-              log_dict[param_name] = log_dict.get(param_name, {})
-              log_dict[param_name][f"layer_{layer_idx}"] = norm
+        for param_name, norm in grad_norm_dict.items():
+            log_dict[param_name] = norm
+
+        for state_name, norm in state_norm_dict.items():
+            log_dict[state_name] = norm
         wandb.log(log_dict, step=step)
 
 if master_process:
