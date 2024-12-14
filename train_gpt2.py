@@ -255,7 +255,7 @@ class GPT(nn.Module):
         layer_outputs = []
         for block in self.transformer.h:
             x, v1 = block(x, v1, x0)
-            layer_outputs.append(x)
+            layer_outputs.append(x.norm(dim=-1).mean())
         x = F.rms_norm(x, (x.size(-1),))
 
         logits = self.lm_head(x)
@@ -563,9 +563,9 @@ for step in range(args.num_iterations + 1):
     if master_process and layer_outputs is not None:
         state_norm_dict = {}
         for i, layer_output in enumerate(layer_outputs):
-            state_norm_dict[f"state_norm/layer_{i}"] = layer_output.norm().item()
+            state_norm_dict[f"state_norm/layer_{i}"] = layer_output.mean().item()
 
-    if master_process and logits is not None:
+    if master_process and logits_mean is not None:
         logit_mean = logits_mean.item()
 
     # step the optimizers and schedulers
