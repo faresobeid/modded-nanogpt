@@ -1,4 +1,3 @@
-
 import os
 import sys
 with open(sys.argv[0]) as f:
@@ -176,6 +175,10 @@ class CausalSelfAttention(nn.Module):
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
         self.rotary = Rotary(self.head_dim)
         self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
+        self.first_layer = False
+
+    def set_first_layer(self, first_layer):
+        self.first_layer = first_layer
 
     def forward(self, x, v1=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -186,12 +189,25 @@ class CausalSelfAttention(nn.Module):
             v1 = v # This happens if we are in the first block. v needs to be accessed by subsequent blocks
         v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
         cos, sin = self.rotary(q)
-        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
+        # q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+
+        if self.first_layer:
+            # Manual attention calculation for the first layer
+            k = k.transpose(1, 2)
+            q = q.transpose(1, 2)
+            v = v.transpose(1, 2)
+            att = (q @ k.transpose(-2, -1)) * (1.0 / (self.head_dim ** 0.5))
+            max_pre_softmax_logit = att.max(dim=-1).values.mean().item() # Log max pre-softmax logit
+            att = att.softmax(dim=-1)
+            y = att @ v
+        else:
+            y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+            max_pre_softmax_logit = None
+
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
-        return y, v1
+        return y, v1, max_pre_softmax_logit
 
 class MLP(nn.Module):
 
@@ -216,11 +232,11 @@ class Block(nn.Module):
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
     def forward(self, x, v1, x0):
-        x = self.lambdas[0] * x + self.lambdas[1] * x0
-        x1, v1 = self.attn(F.rms_norm(x, (x.size(-1),)), v1)
+        # x = self.lambdas[0] * x + self.lambdas[1] * x0
+        x1, v1, max_pre_softmax_logit = self.attn(F.rms_norm(x, (x.size(-1),)), v1)
         x = x + x1
         x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
-        return x, v1
+        return x, v1, max_pre_softmax_logit
 
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
@@ -242,6 +258,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
+        self.transformer.wte.weight.data.normal_(mean=0.0, std=0.01)
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
@@ -253,16 +270,20 @@ class GPT(nn.Module):
         x0 = x
         v1 = None
         layer_outputs = []
-        for block in self.transformer.h:
-            x, v1 = block(x, v1, x0)
-            layer_outputs.append(x.norm(dim=-1).mean())
+        max_pre_softmax_logits = []
+        for i, block in enumerate(self.transformer.h):
+            # block.attn.set_first_layer(i == 0)
+            x, v1, max_pre_softmax_logit = block(x, v1, x0)
+            layer_outputs.append(x.amax(dim=-1).mean())
+            if max_pre_softmax_logit is not None:
+                max_pre_softmax_logits.append(max_pre_softmax_logit)
         x = F.rms_norm(x, (x.size(-1),))
 
         logits = self.lm_head(x)
-        logits = 30 * torch.tanh(logits / 30) # @Grad62304977
+        # logits = 30 * torch.tanh(logits / 30) # @Grad62304977
         logits = logits.float()
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
-        return loss.float(), layer_outputs, logits.mean()
+        return loss.float(), layer_outputs, logits.mean(), max_pre_softmax_logits
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -348,12 +369,12 @@ class Hyperparameters:
     input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int = 8*64 # batch size, in sequences, across all devices
-    device_batch_size : int = 64 # batch size, in sequences, per device
-    sequence_length : int = 1024 # sequence length, in tokens
-    num_iterations : int = 3242 # number of iterations to run
+    batch_size : int = 8*128 # batch size, in sequences, across all devices
+    device_batch_size : int = 128 # batch size, in sequences, per device
+    sequence_length : int = 512 # sequence length, in tokens
+    num_iterations : int = 3248 # number of iterations to run
     warmup_iters : int = 0
-    warmdown_iters : int = 926 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+    warmdown_iters : int = 928 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -430,7 +451,8 @@ x, y = train_loader.next_batch()
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
+gpt_config = GPTConfig(vocab_size=num_vocab, n_layer=48, n_head=3, n_embd=384)
+model = GPT(gpt_config)
 model = model.cuda().bfloat16()
 for m in model.modules():
     if isinstance(m, CastedLinear):
@@ -450,12 +472,14 @@ enable_mem_efficient_sdp(False)
 enable_math_sdp(False)
 
 # init the optimizer(s)
-optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.3,   betas=(0.9, 0.95), fused=True)
-optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.002, betas=(0.9, 0.95), fused=True)
+base_lr = 0.02
+main_lr = 0.02 * 768 / gpt_config.n_embd
+optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=base_lr,   betas=(0.9, 0.95), fused=True)
+optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=main_lr / 10, betas=(0.9, 0.95), fused=True)
 params = list(raw_model.transformer.h.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2]
-optimizer3 = Muon(matrix_params, lr=0.02, momentum=0.95)
+optimizer3 = Muon(matrix_params, lr=main_lr, momentum=0.95)
 optimizer4 = torch.optim.Adam(scalar_params, lr=0.02, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 # learning rate decay scheduler (linear warmup and warmdown)
@@ -534,9 +558,10 @@ for step in range(args.num_iterations + 1):
     # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
     layer_outputs = None
+    max_pre_softmax_logits = None
     for i in range(1, train_accumulation_steps+1):
         # forward pass
-        loss, layer_outputs, logits_mean = model(x, y)
+        loss, layer_outputs, logits_mean, max_pre_softmax_logits = model(x, y)
         train_loss = loss.detach()
         # advance the dataset for the next batch
         x, y = train_loader.next_batch()
@@ -563,7 +588,11 @@ for step in range(args.num_iterations + 1):
     if master_process and layer_outputs is not None:
         state_norm_dict = {}
         for i, layer_output in enumerate(layer_outputs):
-            state_norm_dict[f"state_norm/layer_{i}"] = layer_output.mean().item()
+            state_norm_dict[f"max_hidden_state_value/layer_{i}"] = layer_output.mean().item()
+    
+    # Log max pre-softmax attention logits for the first layer
+    if master_process and max_pre_softmax_logits:
+        wandb.log({"max_pre_softmax_attention_logit/first_layer": max_pre_softmax_logits[0]}, step=step)
 
     if master_process and logits_mean is not None:
         logit_mean = logits_mean.item()
