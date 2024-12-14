@@ -2,3 +2,4 @@ numpy
 tqdm
 torch==2.5.1
 huggingface-hub
+wandb
